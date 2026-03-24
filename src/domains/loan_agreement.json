@@ -1,0 +1,60 @@
+{
+  "domain_id": "loan_agreement",
+  "display_name": "Договор займа",
+  "extends": "_base_legal_ru",
+
+  "entity_hints": {
+    "lender": { "pattern": "займодав|кредитор", "case_insensitive": true },
+    "borrower": { "pattern": "заемщик|должник", "case_insensitive": true },
+    "loan": { "pattern": "\\bзаем\\b|\\bзайм[аы]\\b|кредит[а]?\\b", "case_insensitive": true },
+    "interest": { "pattern": "процент[ы]?\\b(?!.*ставк)|ставк[аи]", "case_insensitive": true },
+    "provision": { "pattern": "предоставлен|транш|выдач", "case_insensitive": true },
+    "penalty": { "pattern": "неустойк|штраф|пен[ия]", "case_insensitive": true }
+  },
+
+  "type_hints": {
+    "amount": { "pattern": "сумм[аыу]|рубл|размер[а]?(?!\\s*неустойки)|\\d+\\s*%|процент[ао]?в?\\b(?!.*ставк)", "case_insensitive": true },
+    "days": { "pattern": "\\d+\\s*\\([^)]+\\)\\s*(дн|рабочих|календарн)", "case_insensitive": true },
+    "rate": { "pattern": "размер[а]?\\s*(неустойки|процент)|ставк[аи]|%\\s*годовых", "case_insensitive": true }
+  },
+
+  "field_name_map": {
+    "сумма": "amount",
+    "сумму": "amount",
+    "размер": "amount",
+    "срок": "deadline",
+    "цель": "description",
+    "цели": "description",
+    "ставка": "rate",
+    "процент": "rate",
+    "неустойка": "penalty_rate",
+    "вниманию": "attention"
+  },
+
+  "optional_classifiers": [
+    { "keywords": ["процент", "начисля"], "tag": "optional:interest_clause" },
+    { "keywords": ["целев"], "tag": "optional:purpose" },
+    { "keywords": ["транш"], "tag": "optional:tranches" }
+  ],
+
+  "alternative_classifiers": [
+    { "keywords": ["процент", "ставк"], "group_id": "interest_type" },
+    { "keywords": ["транш", "предоставл"], "group_id": "loan_provision" },
+    { "keywords": ["заемщик", "юридическ"], "group_id": "borrower_status" }
+  ],
+
+  "combo_options": {
+    "days": [
+      ["5 (пяти)", "5 (пяти)"],
+      ["10 (десяти)", "10 (десяти)"],
+      ["15 (пятнадцати)", "15 (пятнадцати)"],
+      ["30 (тридцати)", "30 (тридцати)"]
+    ]
+  },
+
+  "llm_context": {
+    "document_type": "договор займа",
+    "system_prompt": "Ты эксперт по анализу юридических документов (договоров займа).\n\nДля каждого поля определи:\n- entity: сущность ({entity_list})\n- field_name: имя поля на английском ({field_name_examples})\n- field_type: тип ({field_type_list})\n\nВАЖНО:\n- Поля банковских реквизитов разбивай на: account_number, bank_name, bik, corr_account\n- Для траншей добавляй индекс: tranche_1_amount, tranche_1_deadline\n- Отвечай ТОЛЬКО валидным JSON массивом, без пояснений и markdown.",
+    "user_prompt_template": "Классифицируй эти поля из договора займа:\n\n{fields_json}\n\nВерни JSON массив:\n[{{\"id\": 0, \"entity\": \"...\", \"field_name\": \"...\", \"field_type\": \"...\"}}]"
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "domain_id": "_base_legal_ru",
+  "display_name": "Базовый юридический (РФ)",
+  "extends": null,
+
+  "entity_hints": {
+    "agreement": { "pattern": "договор[а]?\\b|соглашени", "case_insensitive": true },
+    "notice": { "pattern": "уведомлен|сообщен|адрес.*для", "case_insensitive": true },
+    "representations": { "pattern": "заверен|гарант|обстоятельств", "case_insensitive": true },
+    "covenants": { "pattern": "обязательств[а]?\\s*(общего|заемщик)|ковенант", "case_insensitive": true },
+    "default_events": { "pattern": "неисполнен|нарушен|дефолт", "case_insensitive": true },
+    "dispute": { "pattern": "спор|арбитраж|суд\\b", "case_insensitive": true }
+  },
+
+  "type_hints": {
+    "date": { "pattern": "дат[аыуе]|год[а]?|числ[оа]|срок", "case_insensitive": true },
+    "name": { "pattern": "наименован|название|ФИО|имя|именуем", "case_insensitive": true },
+    "address": { "pattern": "\\bадрес|город|улиц", "case_insensitive": true },
+    "email": { "pattern": "электронн|почт|e-?mail|@", "case_insensitive": true },
+    "representative": { "pattern": "в лице|представител|действующ", "case_insensitive": true },
+    "authority": { "pattern": "основании|устав|доверенност", "case_insensitive": true },
+    "account": { "pattern": "счет[а]?\\b|БИК|банк[а]?\\b|к/с|корресп", "case_insensitive": true }
+  },
+
+  "field_name_map": {
+    "дата": "date",
+    "дату": "date",
+    "наименование": "name",
+    "название": "name",
+    "имя": "name",
+    "представитель": "representative",
+    "представителя": "representative",
+    "основание": "authority_basis",
+    "основании": "authority_basis",
+    "адрес": "address",
+    "город": "city",
+    "место": "city",
+    "счет": "account",
+    "счёт": "account",
+    "банк": "bank_name",
+    "бик": "bik",
+    "email": "email",
+    "почта": "email",
+    "должность": "signatory_title",
+    "подпись": "signatory_name"
+  },
+
+  "optional_classifiers": [
+    { "keywords": ["уведомлен"], "tag": "optional:notice" },
+    { "keywords": ["ликвидац", "реорганиз"], "tag": "optional:liquidation" },
+    { "keywords": ["банкротств"], "tag": "optional:bankruptcy" },
+    { "keywords": ["заверен", "гарант"], "tag": "optional:representation" }
+  ],
+
+  "alternative_classifiers": [
+    { "keywords": ["арбитраж", "спор"], "group_id": "dispute_resolution" }
+  ],
+
+  "combo_options": {},
+
+  "llm_context": {
+    "document_type": "юридический документ",
+    "system_prompt": "Ты эксперт по анализу юридических документов.\n\nДля каждого поля определи:\n- entity: сущность ({entity_list})\n- field_name: имя поля на английском ({field_name_examples})\n- field_type: тип ({field_type_list})\n\nВАЖНО:\n- Поля банковских реквизитов разбивай на: account_number, bank_name, bik, corr_account\n- Отвечай ТОЛЬКО валидным JSON массивом, без пояснений и markdown.",
+    "user_prompt_template": "Классифицируй эти поля из документа ({document_type}):\n\n{fields_json}\n\nВерни JSON массив:\n[{{\"id\": 0, \"entity\": \"...\", \"field_name\": \"...\", \"field_type\": \"...\"}}]"
+  }
+}

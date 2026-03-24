@@ -1,0 +1,1058 @@
+name: CC Inspector
+description: Инспектор Content Controls и Custom XML Data для шаблонов Draft Builder (v2, 2026-03-18)
+host: WORD
+api_set: {}
+script:
+  content: |
+    const CUSTOM_XML_URI = "urn:draftbuilder:loan_agreement:v1";
+
+    // Tabs
+    let currentTab = 'xml';
+
+    // Logging
+    function log(msg: string, data?: any) {
+      const timestamp = new Date().toLocaleTimeString();
+      if (data !== undefined) {
+        console.log(`[${timestamp}] ${msg}`, data);
+      } else {
+        console.log(`[${timestamp}] ${msg}`);
+      }
+    }
+
+    Office.onReady(() => {
+      log('CC Inspector initialized');
+      document.getElementById('tab-xml').onclick = () => switchTab('xml');
+      document.getElementById('tab-cc').onclick = () => switchTab('cc');
+      document.getElementById('tab-sync').onclick = () => switchTab('sync');
+      document.getElementById('refresh-btn').onclick = refresh;
+      
+      refresh();
+    });
+
+    function switchTab(tab: string) {
+      log(`Switching to tab: ${tab}`);
+      currentTab = tab;
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.getElementById(`tab-${tab}`).classList.add('active');
+      refresh();
+    }
+
+    async function refresh() {
+      const content = document.getElementById('content');
+      content.innerHTML = '<div class="loading">Загрузка...</div>';
+      
+      try {
+        log(`Refreshing tab: ${currentTab}`);
+        if (currentTab === 'xml') {
+          content.innerHTML = await getXMLDataHTML();
+        } else if (currentTab === 'cc') {
+          content.innerHTML = await getContentControlsHTML();
+        } else {
+          content.innerHTML = await getSyncStatusHTML();
+        }
+        log(`Tab ${currentTab} loaded successfully`);
+      } catch (e) {
+        log(`Error loading tab ${currentTab}:`, e);
+        content.innerHTML = `<div class="error">Ошибка: ${e.message}</div>`;
+      }
+    }
+
+    async function getXMLDataHTML(): Promise<string> {
+      return Word.run(async (context) => {
+        const xmlParts = context.document.customXmlParts;
+        xmlParts.load('items');
+        await context.sync();
+
+        log(`Found ${xmlParts.items.length} Custom XML Parts`);
+
+        for (let i = 0; i < xmlParts.items.length; i++) {
+          const part = xmlParts.items[i];
+          const xml = part.getXml();
+          await context.sync();
+          
+          if (xml.value.includes(CUSTOM_XML_URI)) {
+            log('Found Draft Builder XML Part');
+            return formatXMLasHTML(xml.value);
+          }
+        }
+        
+        log('Draft Builder XML Part NOT found');
+        return `<div class="warning">⚠ Custom XML Part не найден<br><small>Namespace: ${CUSTOM_XML_URI}</small></div>`;
+      });
+    }
+
+    function formatXMLasHTML(xmlString: string): string {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(xmlString, 'text/xml');
+      const root = doc.documentElement;
+      
+      let html = '<div class="xml-tree">';
+      html += formatXMLNode(root, 0);
+      html += '</div>';
+      return html;
+    }
+
+    function formatXMLNode(node: Element, level: number): string {
+      const indent = level * 16;
+      const name = node.localName || node.nodeName;
+      const children = Array.from(node.children);
+      
+      if (children.length === 0) {
+        const value = node.textContent?.trim() || '';
+        const icon = value ? '✓' : '○';
+        const valueClass = value ? 'value-filled' : 'value-empty';
+        const displayValue = value || '(пусто)';
+        
+        return `<div class="xml-node leaf" style="padding-left:${indent}px">
+          <span class="icon">${icon}</span>
+          <span class="node-name">${name}</span>
+          <span class="node-value ${valueClass}">${escapeHtml(displayValue)}</span>
+        </div>`;
+      } else {
+        let html = `<div class="xml-node folder" style="padding-left:${indent}px">
+          <span class="icon">📁</span>
+          <span class="node-name">${name}</span>
+        </div>`;
+        children.forEach(child => {
+          html += formatXMLNode(child as Element, level + 1);
+        });
+        return html;
+      }
+    }
+
+    interface CCInfo {
+      tag: string;
+      title: string;
+      type: string;
+      text: string;
+      depth: number;
+      parentTag: string;
+    }
+
+    // Collect ALL content controls by parsing OOXML (includes nested CCs)
+    async function collectAllContentControls(context: Word.RequestContext): Promise<CCInfo[]> {
+      const allCCs: CCInfo[] = [];
+      
+      // Get OOXML of the document body
+      const body = context.document.body;
+      const ooxml = body.getOoxml();
+      await context.sync();
+      
+      log(`Got OOXML, length: ${ooxml.value.length}`);
+      
+      // Parse OOXML to extract CC info
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(ooxml.value, 'text/xml');
+      
+      // Find all sdt elements (Content Controls)
+      const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+      const sdts = doc.getElementsByTagNameNS(W_NS, 'sdt');
+      
+      log(`Found ${sdts.length} sdt elements in OOXML`);
+      
+      for (let i = 0; i < sdts.length; i++) {
+        const sdt = sdts[i];
+        
+        // Find sdtPr (properties)
+        const sdtPr = sdt.getElementsByTagNameNS(W_NS, 'sdtPr')[0];
+        if (!sdtPr) continue;
+        
+        // Get tag
+        const tagEl = sdtPr.getElementsByTagNameNS(W_NS, 'tag')[0];
+        const tag = tagEl?.getAttributeNS(W_NS, 'val') || '';
+        
+        // Get alias (title)
+        const aliasEl = sdtPr.getElementsByTagNameNS(W_NS, 'alias')[0];
+        const title = aliasEl?.getAttributeNS(W_NS, 'val') || '';
+        
+        // Determine type
+        let type = 'Unknown';
+        if (sdtPr.getElementsByTagNameNS(W_NS, 'text').length > 0) type = 'PlainText';
+        else if (sdtPr.getElementsByTagNameNS(W_NS, 'date').length > 0) type = 'Date';
+        else if (sdtPr.getElementsByTagNameNS(W_NS, 'comboBox').length > 0) type = 'ComboBox';
+        else if (sdtPr.getElementsByTagNameNS(W_NS, 'dropDownList').length > 0) type = 'Dropdown';
+        else type = 'RichText';
+        
+        // Get text content from sdtContent
+        const sdtContent = sdt.getElementsByTagNameNS(W_NS, 'sdtContent')[0];
+        let text = '';
+        if (sdtContent) {
+          // Get all w:t elements
+          const tElements = sdtContent.getElementsByTagNameNS(W_NS, 't');
+          for (let j = 0; j < tElements.length; j++) {
+            text += tElements[j].textContent || '';
+          }
+        }
+        
+        // Check if nested (has parent sdt)
+        let depth = 0;
+        let parent = sdt.parentElement;
+        while (parent) {
+          if (parent.localName === 'sdt') depth++;
+          parent = parent.parentElement;
+        }
+        
+        allCCs.push({
+          tag: tag,
+          title: title,
+          type: type,
+          text: text.substring(0, 100),
+          depth: depth,
+          parentTag: ''
+        });
+      }
+      
+      log(`Total CCs from OOXML: ${allCCs.length}`);
+      return allCCs;
+    }
+
+    async function getContentControlsHTML(): Promise<string> {
+      return Word.run(async (context) => {
+        const allCCs = await collectAllContentControls(context);
+
+        if (allCCs.length === 0) {
+          return '<div class="warning">Нет Content Controls в документе</div>';
+        }
+
+        // Группируем CC
+        const altGroups: Record<string, CCInfo[]> = {};
+        const optionalList: CCInfo[] = [];
+        const dataFields: CCInfo[] = [];
+
+        const typeNames: Record<string, string> = {
+          'RichText': 'RichText',
+          'PlainText': 'PlainText', 
+          'PlainTextInline': 'PlainText',
+          'Date': 'Date',
+          'DropDownList': 'Dropdown',
+          'ComboBox': 'ComboBox',
+          'CheckBox': 'CheckBox',
+          'RepeatingSection': 'Repeating',
+          'Unknown': '?'
+        };
+
+        for (const cc of allCCs) {
+          const info = {
+            ...cc,
+            type: typeNames[cc.type] || cc.type
+          };
+
+          if (info.tag.startsWith('alt:')) {
+            const match = info.tag.match(/^alt:([^:]+):/);
+            if (match) {
+              const groupName = match[1];
+              if (!altGroups[groupName]) altGroups[groupName] = [];
+              altGroups[groupName].push(info);
+            }
+          } else if (info.tag.startsWith('optional:')) {
+            optionalList.push(info);
+          } else if (info.tag && info.tag.includes('/')) {
+            // Data fields have / in tag
+            dataFields.push(info);
+          }
+        }
+
+        log(`Categorized: alt groups=${Object.keys(altGroups).length}, optional=${optionalList.length}, data fields=${dataFields.length}`);
+
+        let html = `<div class="summary">Всего: <strong>${allCCs.length}</strong> CC (включая вложенные)</div>`;
+
+        // === Альтернативные группы ===
+        const altGroupNames = Object.keys(altGroups).sort();
+        if (altGroupNames.length > 0) {
+          html += `<div class="section-header alt-header">
+            <span class="section-icon">⚡</span> Альтернативы <span class="section-count">${altGroupNames.length} групп</span>
+          </div>`;
+          html += '<div class="section-hint">Выбери один вариант, удали остальные</div>';
+
+          for (const groupName of altGroupNames) {
+            const items = altGroups[groupName];
+            html += `<div class="alt-group">
+              <div class="group-header">alt:${escapeHtml(groupName)}</div>`;
+            
+            for (const item of items) {
+              const variantNum = item.tag.split(':').pop();
+              html += `<div class="alt-item">
+                <div class="alt-variant">
+                  <span class="variant-num">:${variantNum}</span>
+                  <span class="variant-title">${escapeHtml(item.title)}</span>
+                </div>
+                <div class="alt-preview">${escapeHtml(item.text.substring(0, 80))}${item.text.length > 80 ? '...' : ''}</div>
+              </div>`;
+            }
+            html += '</div>';
+          }
+        }
+
+        // === Optional блоки ===
+        if (optionalList.length > 0) {
+          html += `<div class="section-header optional-header">
+            <span class="section-icon">☐</span> Условные блоки <span class="section-count">${optionalList.length}</span>
+          </div>`;
+          html += '<div class="section-hint">Удали если не нужны</div>';
+
+          for (const item of optionalList) {
+            const shortTag = item.tag.replace('optional:', '');
+            html += `<div class="optional-item">
+              <div class="optional-tag"><code>${escapeHtml(shortTag)}</code></div>
+              <div class="optional-title">${escapeHtml(item.title)}</div>
+            </div>`;
+          }
+        }
+
+        // === Поля данных ===
+        if (dataFields.length > 0) {
+          html += `<div class="section-header data-header" onclick="toggleDataFields()">
+            <span class="section-icon">📝</span> Поля данных <span class="section-count">${dataFields.length}</span>
+            <span class="expand-icon" id="data-expand">▾</span>
+          </div>`;
+          
+          // Expand by default now
+          html += '<div id="data-fields" class="data-fields">';
+          
+          // Группируем по первой части tag
+          const byPrefix: Record<string, CCInfo[]> = {};
+          for (const item of dataFields) {
+            const prefix = item.tag.split('/')[0] || 'other';
+            if (!byPrefix[prefix]) byPrefix[prefix] = [];
+            byPrefix[prefix].push(item);
+          }
+
+          for (const prefix of Object.keys(byPrefix).sort()) {
+            html += `<div class="data-group">
+              <div class="data-group-name">${escapeHtml(prefix)} <span class="data-group-count">(${byPrefix[prefix].length})</span></div>`;
+            
+            for (const item of byPrefix[prefix]) {
+              const shortTag = item.tag.replace(prefix + '/', '');
+              const hasValue = item.text && item.text !== '[●]' && !item.text.startsWith('[');
+              const nestedIndicator = item.depth > 0 ? `<span class="nested-badge" title="Inside: ${item.parentTag}">↳</span>` : '';
+              html += `<div class="data-item ${hasValue ? 'has-value' : ''}">
+                ${nestedIndicator}
+                <span class="data-tag">${escapeHtml(shortTag)}</span>
+                <span class="data-type">${escapeHtml(item.type)}</span>
+                <span class="data-value">${hasValue ? escapeHtml(item.text.substring(0, 40)) : '○'}</span>
+              </div>`;
+            }
+            html += '</div>';
+          }
+          html += '</div>';
+        }
+
+        return html;
+      });
+    }
+    
+    // Toggle для секции данных
+    (window as any).toggleDataFields = function() {
+      const el = document.getElementById('data-fields');
+      const icon = document.getElementById('data-expand');
+      if (el && icon) {
+        el.classList.toggle('collapsed');
+        icon.textContent = el.classList.contains('collapsed') ? '▸' : '▾';
+      }
+    };
+
+    async function getSyncStatusHTML(): Promise<string> {
+      return Word.run(async (context) => {
+        // Collect ALL CCs including nested
+        const allCCs = await collectAllContentControls(context);
+
+        // Load XML
+        const xmlParts = context.document.customXmlParts;
+        xmlParts.load('items');
+        await context.sync();
+
+        let xmlDoc: Document | null = null;
+        for (let i = 0; i < xmlParts.items.length; i++) {
+          const part = xmlParts.items[i];
+          const xml = part.getXml();
+          await context.sync();
+          
+          if (xml.value.includes(CUSTOM_XML_URI)) {
+            const parser = new DOMParser();
+            xmlDoc = parser.parseFromString(xml.value, 'text/xml');
+            break;
+          }
+        }
+
+        if (!xmlDoc) {
+          return '<div class="warning">⚠ Custom XML Part не найден</div>';
+        }
+
+        // Collect XML values (with indexed paths for repeating elements)
+        const xmlValues = collectXMLValuesWithIndex(xmlDoc.documentElement);
+        log('XML values collected:', xmlValues);
+
+        // Filter to data fields only (with /)
+        // Exclude: alt:*, optional:*, container tags (tranches, tranches_item_N)
+        const dataFields = allCCs.filter(cc => {
+          if (!cc.tag || !cc.tag.includes('/')) return false;
+          if (cc.tag.startsWith('alt:') || cc.tag.startsWith('optional:')) return false;
+          // Exclude container tags for repeating sections
+          if (cc.tag === 'provision/tranches') return false;
+          if (cc.tag.match(/tranches_item_\d+$/)) return false;
+          return true;
+        });
+        
+        log(`Data fields for sync check: ${dataFields.length}`);
+
+        // Group by tag (multiple CCs can map to same XML element)
+        const byTag: Record<string, CCInfo[]> = {};
+        for (const cc of dataFields) {
+          if (!byTag[cc.tag]) byTag[cc.tag] = [];
+          byTag[cc.tag].push(cc);
+        }
+
+        let html = '<div class="sync-header">CC ↔ XML Sync Status</div>';
+        
+        const sortedTags = Object.keys(byTag).sort();
+        let okCount = 0;
+        let failCount = 0;
+        let noXmlCount = 0;
+
+        for (const tag of sortedTags) {
+          const ccs = byTag[tag];
+          
+          // Try to find XML value - check both exact tag and normalized path
+          let xmlValue = xmlValues[tag];
+          let xmlPath = tag;
+          
+          // If not found, try normalizing the tag (for indexed elements like tranche[1])
+          if (xmlValue === undefined) {
+            xmlPath = normalizeTagToXmlPath(tag);
+            xmlValue = xmlValues[xmlPath];
+          }
+          
+          const hasXml = xmlValue !== undefined;
+          
+          // Get CC text (use first one)
+          const ccText = ccs[0].text?.trim() || '';
+          const ccValue = (ccText === '[●]' || ccText.startsWith('[')) ? '' : ccText;
+          
+          let status = 'noxml';
+          let icon = '○';
+          
+          if (hasXml) {
+            // Compare values
+            const xmlTrimmed = (xmlValue || '').trim();
+            const ccTrimmed = ccValue.trim();
+            
+            if (xmlTrimmed === ccTrimmed) {
+              status = 'ok';
+              icon = '✓';
+              okCount++;
+            } else {
+              status = 'fail';
+              icon = '✗';
+              failCount++;
+              log(`Mismatch for ${tag}: XML="${xmlTrimmed}" CC="${ccTrimmed}"`);
+            }
+          } else {
+            noXmlCount++;
+            log(`No XML path for tag: ${tag}`);
+          }
+
+          const displayTag = tag.length > 25 ? '...' + tag.slice(-22) : tag;
+          const displayValue = hasXml ? (xmlValue || '(пусто)') : '—';
+          const multiBadge = ccs.length > 1 ? `<span class="sync-mult">×${ccs.length}</span>` : '';
+
+          html += `<div class="sync-row status-${status}">
+            <span class="sync-icon">${icon}</span>
+            <span class="sync-field" title="${escapeHtml(tag)}">${escapeHtml(displayTag)}</span>
+            ${multiBadge}
+            <span class="sync-val" title="${escapeHtml(displayValue)}">${escapeHtml(displayValue.substring(0, 30))}</span>
+          </div>`;
+
+          // Show mismatch details
+          if (status === 'fail') {
+            html += `<div class="sync-detail-row">
+              <span class="label">XML:</span> "${escapeHtml(xmlValue || '')}" 
+              <span class="label">CC:</span> "${escapeHtml(ccValue)}"
+            </div>`;
+          }
+        }
+
+        html += `<div class="sync-summary">
+          <span class="sync-ok">✓ ${okCount}</span>
+          <span class="sync-fail">✗ ${failCount}</span>
+          <span class="sync-noxml">○ ${noXmlCount} без XML</span>
+        </div>`;
+
+        return html;
+      });
+    }
+
+    // Collect all leaf values from XML
+    function collectXMLValues(element: Element, prefix: string = ''): Record<string, string> {
+      const values: Record<string, string> = {};
+      const localName = element.localName || element.nodeName.replace(/^[^:]+:/, '');
+      
+      // Skip root element (loan_agreement), start building path from children
+      const isRoot = !prefix && (localName === 'loan_agreement');
+      const currentPath = isRoot ? '' : (prefix ? `${prefix}/${localName}` : localName);
+      
+      // Use childNodes + filter for XML with namespaces
+      const children = Array.from(element.childNodes).filter(n => n.nodeType === 1) as Element[];
+      
+      log(`XML: ${localName}, prefix="${prefix}", path="${currentPath}", children=${children.length}`);
+      
+      if (children.length === 0) {
+        // Leaf node - get text content
+        const value = element.textContent?.trim() || '';
+        if (currentPath) {
+          values[currentPath] = value;
+          log(`  Leaf: ${currentPath} = "${value.substring(0, 20)}"`);
+        }
+      } else {
+        // Has children - recurse with currentPath as new prefix
+        for (const child of children) {
+          const childValues = collectXMLValues(child, currentPath);
+          Object.assign(values, childValues);
+        }
+      }
+      
+      return values;
+    }
+
+    function escapeHtml(str: string): string {
+      return str
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    // Normalize CC tag to XML path
+    // e.g. "provision/tranches/tranche[1]/amount" -> "provision/tranches/tranche[1]/amount"
+    // Tags like "provision/tranches_item_1" are container tags without XML mapping
+    function normalizeTagToXmlPath(tag: string): string {
+      // Remove _item_N suffix (container tags)
+      if (tag.match(/_item_\d+$/)) {
+        return ''; // No XML mapping for container tags
+      }
+      // Keep indexed paths as-is, they should match XML indexed paths
+      return tag;
+    }
+
+    // Collect all leaf values from XML with indexed paths for repeating elements
+    function collectXMLValuesWithIndex(element: Element, prefix: string = '', counters: Record<string, number> = {}): Record<string, string> {
+      const values: Record<string, string> = {};
+      const localName = element.localName || element.nodeName.replace(/^[^:]+:/, '');
+      
+      // Skip root element (loan_agreement)
+      const isRoot = !prefix && (localName === 'loan_agreement');
+      
+      let currentPath = '';
+      if (!isRoot) {
+        // Check if this element name already appeared at this level (repeating element)
+        const counterKey = prefix + '/' + localName;
+        if (counters[counterKey] === undefined) {
+          counters[counterKey] = 1;
+        } else {
+          counters[counterKey]++;
+        }
+        
+        const index = counters[counterKey];
+        // Only add index if there are multiple siblings with same name
+        // For now, always add index for known repeating elements
+        if (localName === 'tranche') {
+          currentPath = prefix ? `${prefix}/${localName}[${index}]` : `${localName}[${index}]`;
+        } else {
+          currentPath = prefix ? `${prefix}/${localName}` : localName;
+        }
+      }
+      
+      const children = Array.from(element.childNodes).filter(n => n.nodeType === 1) as Element[];
+      
+      if (children.length === 0) {
+        // Leaf node
+        const value = element.textContent?.trim() || '';
+        if (currentPath) {
+          values[currentPath] = value;
+          log(`  XML Leaf: ${currentPath} = "${value.substring(0, 20)}"`);
+        }
+      } else {
+        // Has children - recurse with new counter scope for child elements
+        const childCounters: Record<string, number> = {};
+        for (const child of children) {
+          const childValues = collectXMLValuesWithIndex(child, currentPath, childCounters);
+          Object.assign(values, childValues);
+        }
+      }
+      
+      return values;
+    }
+  language: typescript
+template:
+  content: |
+    <div id="app">
+      <div class="toolbar">
+        <div class="tabs">
+          <button class="tab active" id="tab-xml">XML Data</button>
+          <button class="tab" id="tab-cc">Controls</button>
+          <button class="tab" id="tab-sync">Sync</button>
+        </div>
+        <button id="refresh-btn" class="refresh-btn">⟳</button>
+      </div>
+      <div id="content" class="content">
+        <div class="loading">Загрузка...</div>
+      </div>
+    </div>
+  language: html
+style:
+  content: |
+    * {
+      box-sizing: border-box;
+    }
+    
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: 'Segoe UI', -apple-system, sans-serif;
+      font-size: 12px;
+      background: #fff;
+    }
+    
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    
+    .toolbar {
+      display: flex;
+      align-items: center;
+      padding: 6px 8px;
+      background: #f3f3f3;
+      border-bottom: 1px solid #e0e0e0;
+      gap: 8px;
+    }
+    
+    .tabs {
+      display: flex;
+      gap: 2px;
+    }
+    
+    .tab {
+      padding: 6px 12px;
+      border: none;
+      background: transparent;
+      cursor: pointer;
+      font-size: 11px;
+      border-radius: 4px;
+      color: #666;
+    }
+    
+    .tab:hover {
+      background: #e8e8e8;
+    }
+    
+    .tab.active {
+      background: #0078d4;
+      color: white;
+    }
+    
+    .refresh-btn {
+      margin-left: auto;
+      padding: 4px 10px;
+      border: 1px solid #ccc;
+      background: #fff;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    
+    .refresh-btn:hover {
+      background: #f0f0f0;
+    }
+    
+    .content {
+      flex: 1;
+      overflow: auto;
+      padding: 8px;
+    }
+    
+    .loading {
+      text-align: center;
+      padding: 40px;
+      color: #888;
+    }
+    
+    .error {
+      padding: 16px;
+      background: #fff0f0;
+      border: 1px solid #ffcccc;
+      border-radius: 4px;
+      color: #cc0000;
+    }
+    
+    .warning {
+      padding: 16px;
+      background: #fff8e6;
+      border: 1px solid #ffe0a0;
+      border-radius: 4px;
+      color: #996600;
+    }
+    
+    .summary {
+      padding: 8px;
+      background: #f5f5f5;
+      border-radius: 4px;
+      margin-bottom: 8px;
+      font-size: 11px;
+    }
+    
+    /* XML Tree */
+    .xml-tree {
+      font-family: 'Consolas', 'Monaco', monospace;
+      font-size: 11px;
+    }
+    
+    .xml-node {
+      padding: 3px 0;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    
+    .xml-node .icon {
+      width: 16px;
+      text-align: center;
+      font-size: 10px;
+    }
+    
+    .xml-node.leaf .icon {
+      color: #107c10;
+    }
+    
+    .xml-node .node-name {
+      color: #0066cc;
+    }
+    
+    .xml-node .node-value {
+      color: #333;
+      margin-left: 4px;
+    }
+    
+    .xml-node .value-empty {
+      color: #ccc;
+      font-style: italic;
+    }
+    
+    /* Sync */
+    .sync-header {
+      font-weight: 600;
+      padding: 8px;
+      background: #f0f0f0;
+      border-radius: 4px;
+      margin-bottom: 8px;
+    }
+    
+    .sync-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 8px;
+      font-size: 11px;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    
+    .sync-icon {
+      width: 14px;
+      text-align: center;
+      font-size: 12px;
+    }
+    
+    .sync-row.status-ok .sync-icon { color: #107c10; }
+    .sync-row.status-fail .sync-icon { color: #d13438; }
+    .sync-row.status-noxml .sync-icon { color: #888; }
+    
+    .sync-row.status-ok { background: #f9fff9; }
+    .sync-row.status-fail { background: #fff6f6; }
+    .sync-row.status-noxml { background: #fafafa; }
+    
+    .sync-field {
+      font-family: monospace;
+      font-size: 10px;
+      color: #333;
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    
+    .sync-mult {
+      font-size: 9px;
+      color: #666;
+      background: #e8e8e8;
+      padding: 1px 5px;
+      border-radius: 8px;
+    }
+    
+    .sync-val {
+      color: #666;
+      font-size: 10px;
+      max-width: 100px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    
+    .sync-row.status-ok .sync-val { color: #107c10; }
+    
+    .sync-detail-row {
+      padding: 4px 8px 4px 28px;
+      font-size: 10px;
+      color: #666;
+      background: #fff0f0;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    
+    .sync-detail-row .label {
+      color: #999;
+      margin-right: 2px;
+    }
+    
+    .sync-summary {
+      display: flex;
+      gap: 16px;
+      padding: 10px;
+      margin-top: 8px;
+      background: #f5f5f5;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    
+    .sync-ok { color: #107c10; }
+    .sync-fail { color: #d13438; }
+    .sync-noxml { color: #888; }
+    
+    /* Section Headers */
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px;
+      margin: 12px 0 4px 0;
+      border-radius: 4px;
+      font-weight: 600;
+      font-size: 12px;
+    }
+    
+    .section-icon {
+      font-size: 14px;
+    }
+    
+    .section-count {
+      font-weight: normal;
+      font-size: 10px;
+      color: inherit;
+      opacity: 0.7;
+      margin-left: auto;
+    }
+    
+    .section-hint {
+      font-size: 10px;
+      color: #888;
+      padding: 0 8px 8px 8px;
+      font-style: italic;
+    }
+    
+    .alt-header {
+      background: #fff3e0;
+      color: #e65100;
+    }
+    
+    .optional-header {
+      background: #e3f2fd;
+      color: #1565c0;
+    }
+    
+    .data-header {
+      background: #e8f5e9;
+      color: #2e7d32;
+      cursor: pointer;
+    }
+    
+    .data-header:hover {
+      background: #c8e6c9;
+    }
+    
+    .expand-icon {
+      margin-left: 4px;
+      font-size: 10px;
+    }
+    
+    /* Alt Groups */
+    .alt-group {
+      margin: 4px 0 12px 0;
+      border: 1px solid #ffcc80;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    
+    .group-header {
+      background: #fff8e1;
+      padding: 6px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      color: #e65100;
+      font-family: monospace;
+    }
+    
+    .alt-item {
+      padding: 6px 8px;
+      border-top: 1px solid #ffecb3;
+      background: #fffde7;
+    }
+    
+    .alt-variant {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    
+    .variant-num {
+      background: #ff9800;
+      color: white;
+      padding: 1px 6px;
+      border-radius: 10px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+    
+    .variant-title {
+      font-size: 11px;
+      font-weight: 500;
+    }
+    
+    .alt-preview {
+      font-size: 10px;
+      color: #888;
+      margin-top: 3px;
+      padding-left: 40px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    
+    /* Optional Items */
+    .optional-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      margin: 2px 0;
+      background: #e3f2fd;
+      border-radius: 4px;
+      border-left: 3px solid #1976d2;
+    }
+    
+    .optional-tag code {
+      background: #bbdefb;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      color: #0d47a1;
+    }
+    
+    .optional-title {
+      font-size: 11px;
+      color: #333;
+    }
+    
+    /* Data Fields */
+    .data-fields {
+      transition: max-height 0.3s ease;
+      overflow: hidden;
+    }
+    
+    .data-fields.collapsed {
+      max-height: 0;
+    }
+    
+    .data-group {
+      margin: 8px 0;
+      border: 1px solid #e0e0e0;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    
+    .data-group-name {
+      font-size: 11px;
+      font-weight: 600;
+      color: #333;
+      padding: 6px 8px;
+      background: #f5f5f5;
+      border-bottom: 1px solid #e0e0e0;
+    }
+    
+    .data-group-count {
+      font-weight: normal;
+      color: #888;
+    }
+    
+    .data-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      font-size: 11px;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    
+    .data-item:last-child {
+      border-bottom: none;
+    }
+    
+    .data-item.has-value {
+      background: #f9fff9;
+    }
+    
+    .nested-badge {
+      color: #888;
+      font-size: 10px;
+    }
+    
+    .data-tag {
+      color: #0066cc;
+      font-family: monospace;
+      font-size: 10px;
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    
+    .data-type {
+      font-size: 9px;
+      color: #888;
+      background: #f0f0f0;
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+    
+    .data-value {
+      color: #107c10;
+      font-size: 10px;
+      max-width: 80px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    
+    .data-item:not(.has-value) .data-value {
+      color: #ccc;
+    }
+  language: css
+libraries: |
+  https://appsforoffice.microsoft.com/lib/1/hosted/office.js
+  @types/office-js
+
+  core-js@2.4.1/client/core.min.js
+  @types/core-js
+
+  jquery@3.1.1
+  @types/jquery@3.3.1
