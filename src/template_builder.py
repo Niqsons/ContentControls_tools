@@ -10,12 +10,15 @@ Template Builder for Draft Builder
 import json
 import copy
 import uuid
+import logging
 import zipfile
 import shutil
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from lxml import etree
 from datetime import datetime
+
+logger = logging.getLogger('draftbuilder.builder')
 
 # ═══════════════════════════════════════════════════════════════════════════
 # OOXML NAMESPACES
@@ -561,7 +564,7 @@ class TemplateBuilder:
     def build(self, output_path: str):
         """Собрать .docx файл"""
         
-        print(f"[BUILD] Creating template...")
+        logger.info("Creating template...")
         
         # Создать временную директорию
         import tempfile
@@ -631,7 +634,7 @@ class TemplateBuilder:
                         arc_name = os.path.relpath(file_path, tmpdir)
                         zf.write(file_path, arc_name)
         
-        print(f"[DONE] {output_path}")
+        logger.info("Done: %s", output_path)
     
     def _write_content_types(self, tmpdir: str):
         ct_ns = "http://schemas.openxmlformats.org/package/2006/content-types"
@@ -829,40 +832,54 @@ class TemplateBuilder:
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _setup_logging(verbose: bool = False):
+    level = logging.DEBUG if verbose else logging.INFO
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)-5s %(name)s  %(message)s',
+        datefmt='%H:%M:%S'
+    ))
+    root = logging.getLogger('draftbuilder')
+    root.setLevel(level)
+    root.addHandler(handler)
+
+
 def main():
     import sys
-    
+
     if len(sys.argv) < 2:
         print("Template Builder for Draft Builder")
         print("")
-        print("Usage: python template_builder.py <config.json> [output.docx]")
+        print("Usage: python template_builder.py <config.json> [output.docx] [--verbose]")
         print("")
         print("Input:  *_config.json from document_analyzer.py")
         print("Output: *_Template.docx with Content Controls")
         sys.exit(1)
-    
+
+    verbose = '--verbose' in sys.argv
+    _setup_logging(verbose)
+
     config_path = sys.argv[1]
-    
+
     if not Path(config_path).exists():
-        print(f"[ERROR] Config not found: {config_path}")
+        logger.error("Config not found: %s", config_path)
         sys.exit(1)
-    
+
     # Output path
-    if len(sys.argv) > 2:
+    if len(sys.argv) > 2 and not sys.argv[2].startswith('--'):
         output_path = sys.argv[2]
     else:
         output_path = Path(config_path).stem.replace('_config', '') + '_Template.docx'
-    
+
     # Load config
-    print(f"[LOAD] {config_path}")
     with open(config_path, 'r', encoding='utf-8') as f:
         config = json.load(f)
-    
-    print(f"       {config['meta']['total_paragraphs']} paragraphs")
-    print(f"       {config['meta']['total_placeholders']} placeholders")
-    print(f"       {config['meta']['total_alternatives']} alternatives")
-    print(f"       {config['meta']['total_optionals']} optionals")
-    
+
+    meta = config['meta']
+    logger.info("Loaded %s: %d paragraphs, %d placeholders, %d alternatives, %d optionals",
+                config_path, meta['total_paragraphs'], meta['total_placeholders'],
+                meta['total_alternatives'], meta['total_optionals'])
+
     # Build
     builder = TemplateBuilder(config)
     builder.build(output_path)

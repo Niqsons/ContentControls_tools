@@ -8,6 +8,7 @@ Document Analyzer for Draft Builder
 
 import re
 import json
+import logging
 import zipfile
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
@@ -16,6 +17,8 @@ from lxml import etree
 
 from domain_config import DomainConfig, load_domain, detect_domain, list_domains
 from llm_provider import get_provider, parse_llm_json
+
+logger = logging.getLogger('draftbuilder.analyzer')
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTS (domain-agnostic markup patterns)
@@ -270,7 +273,6 @@ def find_alternatives(paragraphs: List[Paragraph], domain: DomainConfig) -> List
     if not sep_indices:
         return alternatives
 
-    # Группировать последовательные альтернативы
     groups = []
     current_group = [sep_indices[0]]
 
@@ -289,13 +291,11 @@ def find_alternatives(paragraphs: List[Paragraph], domain: DomainConfig) -> List
         context_para = paragraphs[first_sep - 1] if first_sep > 0 else None
         context_text = context_para.text.lower() if context_para else ''
 
-        # Классификация по доменному конфигу
         group_id = _classify_alternative_group(context_text, domain, first_sep)
 
         if group_id not in alt_counter:
             alt_counter[group_id] = 0
 
-        # Первая альтернатива (до первого /)
         start = max(0, group[0] - 5)
         for i in range(group[0] - 1, max(0, group[0] - 10), -1):
             if paragraphs[i].is_heading or not paragraphs[i].text.strip():
@@ -311,7 +311,6 @@ def find_alternatives(paragraphs: List[Paragraph], domain: DomainConfig) -> List
             text_preview=paragraphs[start].text[:60] if start < len(paragraphs) else '',
         ))
 
-        # Альтернативы между разделителями и после последнего
         for i, sep_idx in enumerate(group):
             alt_counter[group_id] += 1
 
@@ -334,7 +333,6 @@ def find_alternatives(paragraphs: List[Paragraph], domain: DomainConfig) -> List
 
 
 def _classify_alternative_group(context_text: str, domain: DomainConfig, fallback_idx: int) -> str:
-    """Определить group_id альтернативного блока по доменным классификаторам"""
     for classifier in domain.alternative_classifiers:
         keywords = classifier['keywords']
         if all(kw in context_text for kw in keywords):
@@ -391,7 +389,6 @@ def find_optionals(paragraphs: List[Paragraph], domain: DomainConfig) -> List[Op
 
 
 def _classify_optional_tag(text: str, domain: DomainConfig) -> str:
-    """Определить тег для optional блока по доменным классификаторам"""
     text = text.lower()
     for classifier in domain.optional_classifiers:
         keywords = classifier['keywords']
@@ -413,7 +410,6 @@ def classify_by_heuristics(placeholders: List[Placeholder], paragraphs: List[Par
         ai_hint = (ph.ai_comment or '').lower()
         combined = context + ' ' + ai_hint
 
-        # Определить тип поля
         field_type = 'text'
         confidence = 0.3
 
@@ -423,7 +419,6 @@ def classify_by_heuristics(placeholders: List[Placeholder], paragraphs: List[Par
                 confidence = 0.6
                 break
 
-        # Уточнить по AI комментарию
         if ai_hint:
             confidence += 0.2
             for rus_name, eng_name in domain.field_name_map.items():
@@ -432,7 +427,6 @@ def classify_by_heuristics(placeholders: List[Placeholder], paragraphs: List[Par
                     confidence += 0.1
                     break
 
-        # Определить сущность
         entity = None
         for ent, pattern in domain.entity_hints.items():
             if pattern.search(combined):
@@ -449,6 +443,10 @@ def classify_by_heuristics(placeholders: List[Placeholder], paragraphs: List[Par
         if ph.entity and ph.field_name:
             ph.xml_path = f"{ph.entity}/{ph.field_name}"
 
+        logger.debug("PH#%d: type=%s entity=%s field=%s conf=%.2f review=%s",
+                      ph.id, ph.field_type, ph.entity, ph.field_name,
+                      ph.confidence, ph.needs_review)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # STEP 3: LLM CLASSIFICATION
@@ -461,17 +459,20 @@ def classify_with_llm(placeholders: List[Placeholder], domain: DomainConfig,
     uncertain = [ph for ph in placeholders if ph.confidence < 0.7]
 
     if not uncertain:
-        print("[INFO] All placeholders classified with high confidence")
+        logger.info("All placeholders classified with high confidence")
         return
 
     provider = get_provider()
-    print(f"[INFO] Sending {len(uncertain)} placeholders to LLM ({provider.info()})...")
+    total_batches = (len(uncertain) - 1) // batch_size + 1
+    logger.info("Sending %d placeholders to LLM (%s), %d batches",
+                len(uncertain), provider.info(), total_batches)
 
     system_prompt = domain.llm_system_prompt
     user_template = domain.llm_user_prompt_template
 
     for i in range(0, len(uncertain), batch_size):
         batch = uncertain[i:i+batch_size]
+        batch_num = i // batch_size + 1
 
         fields_desc = []
         for idx, ph in enumerate(batch):
@@ -488,24 +489,26 @@ def classify_with_llm(placeholders: List[Placeholder], domain: DomainConfig,
             fields_json=json.dumps(fields_desc, ensure_ascii=False, indent=2),
         )
 
+        logger.info("Batch %d/%d: sending %d fields...", batch_num, total_batches, len(batch))
         response = provider.generate(prompt, system_prompt)
 
         if not response:
-            # LLM не ответил — пометить на ревью
             for ph in batch:
                 ph.needs_review = True
-            print(f"[WARN] Batch {i//batch_size + 1}: LLM returned empty response")
+            logger.warning("Batch %d/%d: empty LLM response, marking %d fields for review",
+                           batch_num, total_batches, len(batch))
             continue
 
         classifications = parse_llm_json(response)
 
         if classifications is None:
-            # Невалидный ответ — пометить на ревью
             for ph in batch:
                 ph.needs_review = True
-            print(f"[WARN] Batch {i//batch_size + 1}: invalid LLM response")
+            logger.warning("Batch %d/%d: invalid LLM response, marking %d fields for review",
+                           batch_num, total_batches, len(batch))
             continue
 
+        classified_count = 0
         for item in classifications:
             idx = item.get('id')
             if idx is not None and idx < len(batch):
@@ -521,11 +524,16 @@ def classify_with_llm(placeholders: List[Placeholder], domain: DomainConfig,
                 ph.confidence = 0.85
                 ph.classified_by = 'llm'
                 ph.needs_review = False
+                classified_count += 1
 
                 if ph.entity and ph.field_name:
                     ph.xml_path = f"{ph.entity}/{ph.field_name}"
 
-        print(f"[INFO] Batch {i//batch_size + 1}/{(len(uncertain)-1)//batch_size + 1} done")
+                logger.debug("  LLM PH#%d -> entity=%s field=%s type=%s",
+                             ph.id, ph.entity, ph.field_name, ph.field_type)
+
+        logger.info("Batch %d/%d done: %d/%d classified",
+                     batch_num, total_batches, classified_count, len(batch))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -584,50 +592,49 @@ def analyze_document(docx_path: str, use_llm: bool = True,
                      domain_name: str = None) -> DocumentStructure:
     """Полный анализ документа"""
 
-    print(f"[INFO] Analyzing: {docx_path}")
+    logger.info("Analyzing: %s", docx_path)
 
     # Step 1: Extract
-    print("[STEP 1] Extracting document structure...")
+    logger.info("[STEP 1] Extracting document structure...")
     paragraphs = extract_paragraphs(docx_path)
-    print(f"         {len(paragraphs)} paragraphs")
+    logger.info("  %d paragraphs extracted", len(paragraphs))
 
     # Определить домен
     if domain_name:
         domain = load_domain(domain_name)
-        print(f"[DOMAIN] {domain.display_name} (explicit)")
+        logger.info("[DOMAIN] %s (explicit)", domain.display_name)
     else:
         text_sample = ' '.join(p.text for p in paragraphs[:50] if p.text)
         domain = detect_domain(text_sample)
-        print(f"[DOMAIN] {domain.display_name} (auto-detected)")
+        logger.info("[DOMAIN] %s (auto-detected)", domain.display_name)
 
     placeholders = find_placeholders(paragraphs)
-    print(f"         {len(placeholders)} placeholders")
+    logger.info("  %d placeholders found", len(placeholders))
 
     alternatives = find_alternatives(paragraphs, domain)
-    print(f"         {len(alternatives)} alternative blocks")
+    logger.info("  %d alternative blocks", len(alternatives))
 
     optionals = find_optionals(paragraphs, domain)
-    print(f"         {len(optionals)} optional blocks")
+    logger.info("  %d optional blocks", len(optionals))
 
     # Step 2: Heuristic classification
-    print("[STEP 2] Heuristic classification...")
+    logger.info("[STEP 2] Heuristic classification...")
     classify_by_heuristics(placeholders, paragraphs, domain)
 
     high_conf = len([p for p in placeholders if p.confidence >= 0.7])
-    print(f"         {high_conf}/{len(placeholders)} high confidence")
+    logger.info("  %d/%d high confidence", high_conf, len(placeholders))
 
     # Step 3: LLM classification
     if use_llm:
-        print("[STEP 3] LLM classification...")
+        logger.info("[STEP 3] LLM classification...")
         classify_with_llm(placeholders, domain)
     else:
-        print("[STEP 3] Skipped (--no-llm)")
+        logger.info("[STEP 3] Skipped (--no-llm)")
 
     # Step 4: Build schema
-    print("[STEP 4] Building XML schema...")
+    logger.info("[STEP 4] Building XML schema...")
     xml_schema = build_xml_schema(placeholders)
 
-    # Link placeholders to alternatives/optionals
     for alt in alternatives:
         for ph in placeholders:
             if alt.start_para <= ph.para_idx <= alt.end_para:
@@ -638,7 +645,6 @@ def analyze_document(docx_path: str, use_llm: bool = True,
             if opt.start_para <= ph.para_idx <= opt.end_para:
                 opt.placeholders.append(ph.id)
 
-    # combo_options из домена → в конфиг для builder
     combo_options = {k: [list(item) for item in v] for k, v in domain.combo_options.items()}
 
     structure = DocumentStructure(
@@ -652,8 +658,21 @@ def analyze_document(docx_path: str, use_llm: bool = True,
         combo_options=combo_options,
     )
 
-    print("[DONE] Analysis complete")
+    logger.info("[DONE] Analysis complete")
     return structure
+
+
+def _setup_logging(verbose: bool = False):
+    """Настроить логирование"""
+    level = logging.DEBUG if verbose else logging.INFO
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)-5s %(name)s  %(message)s',
+        datefmt='%H:%M:%S'
+    ))
+    root = logging.getLogger('draftbuilder')
+    root.setLevel(level)
+    root.addHandler(handler)
 
 
 def main():
@@ -661,7 +680,6 @@ def main():
 
     # --list-domains
     if '--list-domains' in sys.argv:
-        print("Available domains:")
         for d in list_domains():
             print(f"  {d['id']:20} {d['name']}")
         sys.exit(0)
@@ -676,15 +694,20 @@ def main():
         print("  --no-llm              Skip LLM classification")
         print("  --domain <name>       Use specific domain (default: auto-detect)")
         print("  --list-domains        List available domain configs")
+        print("  --verbose             Debug logging")
         print("")
         print("Environment variables:")
         print("  DRAFTBUILDER_LLM_PROVIDER  ollama | openrouter (default: ollama)")
         print("  DRAFTBUILDER_LLM_MODEL     Model name (default: qwen3:32b)")
         print("  DRAFTBUILDER_LLM_URL       API endpoint")
         print("  DRAFTBUILDER_LLM_API_KEY   API key (for openrouter)")
+        print("  DRAFTBUILDER_LLM_TIMEOUT   Request timeout in seconds (default: 300)")
         print("")
         print(f"LLM: {provider.info()}")
         sys.exit(1)
+
+    verbose = '--verbose' in sys.argv
+    _setup_logging(verbose)
 
     docx_path = sys.argv[1]
     use_llm = '--no-llm' not in sys.argv
@@ -697,7 +720,7 @@ def main():
             domain_name = sys.argv[idx + 1]
 
     if not Path(docx_path).exists():
-        print(f"[ERROR] File not found: {docx_path}")
+        logger.error("File not found: %s", docx_path)
         sys.exit(1)
 
     # Analyze
@@ -710,34 +733,26 @@ def main():
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
-    print(f"\n[OUTPUT] {config_path}")
+    logger.info("Output: %s", config_path)
 
     # Summary
-    print(f"\n{'='*50}")
-    print("SUMMARY")
-    print(f"{'='*50}")
-
     type_counts = {}
     for ph in structure.placeholders:
         type_counts[ph.field_type] = type_counts.get(ph.field_type, 0) + 1
-
-    print("\nBy type:")
-    for t, c in sorted(type_counts.items(), key=lambda x: -x[1]):
-        print(f"  {t:12} {c}")
 
     entity_counts = {}
     for ph in structure.placeholders:
         e = ph.entity or 'unclassified'
         entity_counts[e] = entity_counts.get(e, 0) + 1
 
-    print("\nBy entity:")
-    for e, c in sorted(entity_counts.items(), key=lambda x: -x[1]):
-        print(f"  {e:15} {c}")
+    logger.info("=== SUMMARY ===")
+    logger.info("By type:   %s", ', '.join(f'{t}={c}' for t, c in sorted(type_counts.items(), key=lambda x: -x[1])))
+    logger.info("By entity: %s", ', '.join(f'{e}={c}' for e, c in sorted(entity_counts.items(), key=lambda x: -x[1])))
 
     needs_review = [ph for ph in structure.placeholders if ph.needs_review]
     if needs_review:
-        print(f"\n[!] {len(needs_review)} placeholders need manual review")
-        print("    Edit the JSON config before running template_builder.py")
+        logger.warning("%d placeholders need manual review — edit %s before running template_builder.py",
+                       len(needs_review), config_path)
 
 
 if __name__ == '__main__':

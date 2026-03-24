@@ -86,6 +86,7 @@ set DRAFTBUILDER_LLM_MODEL=qwen/qwen3-32b
 | `DRAFTBUILDER_LLM_MODEL` | `qwen3:32b` | Имя модели |
 | `DRAFTBUILDER_LLM_URL` | зависит от провайдера | URL API эндпоинта |
 | `DRAFTBUILDER_LLM_API_KEY` | — | API ключ (для openrouter) |
+| `DRAFTBUILDER_LLM_TIMEOUT` | без ограничения | Timeout одного запроса к LLM в секундах. По умолчанию без лимита — локальные модели на слабом железе могут генерировать долго |
 
 **Ollama** — URL по умолчанию: `http://localhost:11434/api/generate`
 
